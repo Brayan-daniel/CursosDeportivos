@@ -246,7 +246,6 @@ class ReservasModel:
                 cursor.execute(sql_count, tuple(count_values))
                 total_reservas = cursor.fetchone()[0]
 
-
                 return {"reservas": reservas, "total_reservas": total_reservas}
 
         except pymysql.Error as e:
@@ -284,9 +283,13 @@ class ReservasModel:
                 sql_update_reserva = "UPDATE reservas SET estado = %s WHERE id = %s"
                 cursor.execute(sql_update_reserva, (nuevo_estado, reserva_id))
 
-                if estado_actual in ['pendiente', 'validado'] and (nuevo_estado == 'expirado' or nuevo_estado == 'cancelado'):
+                if estado_actual in ['pendiente', 'validado'] and nuevo_estado in ['expirado', 'cancelado']:
                     sql_increment_cupos = "UPDATE cursos SET cupos = cupos + 1 WHERE id = %s"
                     cursor.execute(sql_increment_cupos, (curso_id,))
+
+                if estado_actual not in ['validado'] and nuevo_estado == 'validado':
+                    sql_decrement_cupos = "UPDATE cursos SET cupos = cupos - 1 WHERE id = %s"
+                    cursor.execute(sql_decrement_cupos, (curso_id,))
 
                 conexion.commit()
                 return {
@@ -296,7 +299,7 @@ class ReservasModel:
 
         except pymysql.Error as e:
             conexion.rollback()
-            return {"error": "Error en la base de datos", "codigo": e.args[0], "mensaje": e.args[1]}
+            return {"error": "Error en la base de datos", "codigo": e.args[0], "mensaje": e.args[1], "status_code": 500}
         except Exception as e:
             conexion.rollback()
             return {"error": f"Error interno del servidor: {str(e)}", "status_code": 500}
@@ -450,8 +453,6 @@ class ReservasModel:
                     if current_reserva_estado == 'pendiente':
                         sql_update_reserva = "UPDATE reservas SET estado = 'validado' WHERE id = %s"
                         cursor.execute(sql_update_reserva, (reserva_id,))
-                    else:
-                        pass 
                 elif nuevo_estado == 'rechazado':
                     pass
 
@@ -506,6 +507,115 @@ class ReservasModel:
         except Exception as e:
             conexion.rollback()
             return {"error": f"Error interno del servidor: {str(e)}", "status_code": 500}
+        finally:
+            if conexion:
+                conexion.close()
+
+    @staticmethod
+    def obtener_estudiantes_por_curso(curso_id, profesor_id):
+        conexion = obtenerConexion()
+        if conexion is None:
+            return {"error": "Error de conexión a la base de datos", "status_code": 500}
+        
+        try:
+            with conexion.cursor(pymysql.cursors.DictCursor) as cursor:
+                sql_check_curso_profesor = "SELECT profesor_id FROM cursos WHERE id = %s"
+                cursor.execute(sql_check_curso_profesor, (curso_id,))
+                curso_info = cursor.fetchone()
+
+                if not curso_info or curso_info['profesor_id'] != profesor_id:
+                    return {"error": "Curso no encontrado o no autorizado para este profesor.", "status_code": 403}
+
+                sql = """
+                    SELECT
+                        r.id AS reserva_id,
+                        r.estudiante_id,
+                        u.name AS estudiante_nombre,
+                        u.lastname AS estudiante_apellido,
+                        u.email AS estudiante_email,
+                        r.fecha_reserva,
+                        r.estado AS estado_reserva
+                    FROM
+                        reservas r
+                    JOIN
+                        users u ON r.estudiante_id = u.id
+                    WHERE
+                        r.curso_id = %s AND r.estado IN ('pendiente', 'validado')
+                    ORDER BY
+                        u.lastname, u.name
+                """
+                cursor.execute(sql, (curso_id,))
+                estudiantes = cursor.fetchall()
+
+                return {"estudiantes": estudiantes, "status_code": 200}
+
+        except pymysql.Error as e:
+            print(f"SQL Error en obtener_estudiantes_por_curso: {e.args[1]}")
+            return {"error": "Error en la base de datos", "codigo": e.args[0], "mensaje": e.args[1], "status_code": 500}
+        except Exception as e:
+            print(f"Error general en obtener_estudiantes_por_curso: {str(e)}")
+            return {"error": f"Error interno del servidor: {str(e)}", "status_code": 500}
+        finally:
+            if conexion:
+                conexion.close()
+    
+    @staticmethod
+    def obtener_cursos_validados_por_estudiante(estudiante_id):
+        try:
+            conexion = obtenerConexion()
+            with conexion.cursor(pymysql.cursors.DictCursor) as cursor:
+                consulta_base = """
+                    SELECT
+                        c.id AS curso_id,
+                        c.nombre AS curso_nombre,
+                        c.descripcion AS curso_descripcion,
+                        c.cupos AS curso_cupos,
+                        c.coste AS curso_coste,
+                        cat.nombre AS categoria_nombre,
+                        res.fecha_reserva,
+                        res.estado AS estado_reserva,
+                        res.id AS reserva_id,
+                        p.name AS profesor_nombre,
+                        p.lastname AS profesor_apellido
+                    FROM reservas res
+                    JOIN cursos c ON res.curso_id = c.id
+                    JOIN categorias cat ON c.categoria_id = cat.id
+                    JOIN users p ON c.profesor_id = p.id
+                    WHERE res.estudiante_id = %s AND res.estado = 'validado'
+                    AND res.oculto_para_estudiante = FALSE;
+                """
+                cursor.execute(consulta_base, (estudiante_id,))
+                cursos_validados = cursor.fetchall()
+
+                for curso in cursos_validados:
+                    sql_horarios = """
+                        SELECT dia, hora_inicio, hora_fin
+                        FROM horarios
+                        WHERE curso_id = %s
+                        ORDER BY FIELD(dia, 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'), hora_inicio;
+                    """
+                    cursor.execute(sql_horarios, (curso['curso_id'],))
+                    horarios_raw = cursor.fetchall()
+                    
+                    curso['horarios'] = []
+                    for horario in horarios_raw:
+                        horario_formatted = {
+                            'dia': horario['dia'],
+                            'hora_inicio': str(horario['hora_inicio']) if 'hora_inicio' in horario else None,
+                            'hora_fin': str(horario['hora_fin']) if 'hora_fin' in horario else None
+                        }
+                        curso['horarios'].append(horario_formatted)
+
+                    if 'curso_coste' in curso and isinstance(curso['curso_coste'], Decimal):
+                        curso['curso_coste'] = str(curso['curso_coste'])
+
+                return {"cursos": cursos_validados}
+        except pymysql.Error as e:
+            print(f"Error SQL al obtener cursos validados del estudiante: {e.args[1]}")
+            return {"error": "Error al obtener cursos validados del estudiante.", "codigo": e.args[0], "mensaje": e.args[1], "status_code": 500}
+        except Exception as e:
+            print(f"Error general al obtener cursos validados del estudiante: {e}")
+            return {"error": "Error al obtener cursos validados del estudiante.", "status_code": 500}
         finally:
             if conexion:
                 conexion.close()
